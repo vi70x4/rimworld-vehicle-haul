@@ -54,6 +54,20 @@ namespace AutoVehicleHaul
             ctx.TicksInState++;
             ctx.TicksSinceLastTransition++;
 
+            // Arrival check runs BEFORE driver validation — otherwise a driver
+            // that has temporarily disembarked (e.g. during Loading sub-FSM)
+            // causes IsDriverStateValid to return false and freezes the entire
+            // tick, preventing the vehicle from ever transitioning to Loading.
+            if (ctx.State == VehicleState.MoveToPickup && ctx.Vehicle != null && !ctx.Vehicle.Destroyed)
+            {
+                if (HasArrived(ctx.Vehicle, ctx.TargetPickupPos))
+                {
+                    Log.Message($"[AutoVehicleHaul] Vehicle {ctx.Vehicle.LabelCap} arrived at pickup {ctx.TargetPickupPos}. Transitioning to Loading.");
+                    TransitionState(ctx, VehicleState.Loading);
+                    return;
+                }
+            }
+
             if (!IsDriverStateValid(ctx))
             {
                 Log.Message($"[AutoVehicleHaul] WARNING: Driver state invalid for {ctx.Vehicle?.LabelCap}, state={ctx.State}. Transitioning to FailSafe.");
@@ -179,6 +193,27 @@ namespace AutoVehicleHaul
 
                 // Skip items already reserved by another job
                 if (reservedBy.ContainsKey(thing))
+                    continue;
+
+                // Skip items within 3 cells of any vehicle that is already
+                // heading to or working at a pickup.  This prevents the
+                // "traffic jam" where multiple vehicles converge on nearby
+                // chunks from the same pile.
+                bool tooClose = false;
+                foreach (var kvp in jobContexts)
+                {
+                    var ctx = kvp.Value;
+                    if (ctx.State != VehicleState.MoveToPickup && ctx.State != VehicleState.Loading)
+                        continue;
+                    if (ctx.Vehicle == null || ctx.Vehicle.Destroyed)
+                        continue;
+                    if (ctx.Vehicle.Position.DistanceToSquared(thing.Position) <= 9)  // 3-cell Chebyshev radius
+                    {
+                        tooClose = true;
+                        break;
+                    }
+                }
+                if (tooClose)
                     continue;
 
                 totalDesignatedForHaul++;
@@ -408,7 +443,9 @@ namespace AutoVehicleHaul
                     TransferredCount = 0,
                     TicksInState = 0,
                     CurrentJobTimeout = 600,
-                    FailSafeCooldown = 0
+                    FailSafeCooldown = 0,
+                    LastMovePos = bestVehicle.Position,
+                    StuckTicks = 0
                 };
 
                 // --- Phase 6d: Dispatch ---
@@ -419,6 +456,10 @@ namespace AutoVehicleHaul
                         var targetInfo = new LocalTargetInfo(bestThing.Position);
                         bestVehicle.vehiclePather.StartPath(targetInfo, Verse.AI.PathEndMode.Touch, true);
                         ctx.LastIssuedPathTarget = bestThing.Position;
+
+                        // Reserve the target thing immediately so the next scan
+                        // cycle does not dispatch another vehicle to the same item.
+                        reservedBy[bestThing] = ctx;
 
                         Log.Message($"[AutoVehicleHaul] StartPath called | Dest: {bestThing.Position} | EndMode: Touch | IgnoreReachability: true");
                         Log.Message($"[AutoVehicleHaul] Vehicle Moving: {bestVehicle.vehiclePather.Moving}");
@@ -492,22 +533,42 @@ namespace AutoVehicleHaul
                 return;
             }
 
-            // Issue path if not moving or target changed
+            // Stuck detection: if the vehicle hasn't moved closer to the target
+            // in 120 ticks, it is blocked (e.g. by another vehicle swarming the
+            // same tile). FailSafe instead of looping StartPath forever.
+            int distSqNow = ctx.Vehicle.Position.DistanceToSquared(ctx.TargetPickupPos);
+            int distSqLast = ctx.LastMovePos.DistanceToSquared(ctx.TargetPickupPos);
+            if (distSqNow >= distSqLast)
+            {
+                ctx.StuckTicks++;
+                if (ctx.StuckTicks > 120)
+                {
+                    Log.Message($"[AutoVehicleHaul] MoveToPickup: Vehicle {ctx.Vehicle.LabelCap} stuck for {ctx.StuckTicks} ticks (distSq={distSqNow}). Failing safe.");
+                    TransitionState(ctx, VehicleState.FailSafe);
+                    return;
+                }
+            }
+            else
+            {
+                ctx.StuckTicks = 0;
+                ctx.LastMovePos = ctx.Vehicle.Position;
+            }
+
+            // Issue path if not moving — guard removed: previously required
+            // LastIssuedPathTarget != TargetPickupPos, which prevented re-issue
+            // when a prior path ended without reaching the target.
             if (ctx.Vehicle.vehiclePather != null && !ctx.Vehicle.vehiclePather.Moving)
             {
-                if (ctx.LastIssuedPathTarget != ctx.TargetPickupPos)
+                try
                 {
-                    try
-                    {
-                        var targetInfo = new LocalTargetInfo(ctx.TargetPickupPos);
-                        ctx.Vehicle.vehiclePather.StartPath(targetInfo, Verse.AI.PathEndMode.Touch, true);
-                        ctx.LastIssuedPathTarget = ctx.TargetPickupPos;
-                        Log.Message($"[AutoVehicleHaul] MoveToPickup: StartPath to {ctx.TargetPickupPos}");
-                    }
-                    catch (System.Exception ex)
-                    {
-                        Log.Message($"[AutoVehicleHaul] MoveToPickup StartPath failed: {ex.Message}");
-                    }
+                    var targetInfo = new LocalTargetInfo(ctx.TargetPickupPos);
+                    ctx.Vehicle.vehiclePather.StartPath(targetInfo, Verse.AI.PathEndMode.Touch, true);
+                    ctx.LastIssuedPathTarget = ctx.TargetPickupPos;
+                    Log.Message($"[AutoVehicleHaul] MoveToPickup: StartPath to {ctx.TargetPickupPos}");
+                }
+                catch (System.Exception ex)
+                {
+                    Log.Message($"[AutoVehicleHaul] MoveToPickup StartPath failed: {ex.Message}");
                 }
             }
         }
@@ -771,6 +832,8 @@ namespace AutoVehicleHaul
                 // Release any remaining reservations before transitioning
                 ReleaseReservations(ctx);
                 ReembarkDriver(ctx);
+                ctx.LastMovePos = ctx.Vehicle.Position;
+                ctx.StuckTicks = 0;
                 TransitionState(ctx, VehicleState.MoveToWarehouse);
             }
             else
@@ -881,22 +944,41 @@ namespace AutoVehicleHaul
                 return;
             }
 
-            // Issue path if not moving or target changed
+            // Stuck detection: if the vehicle hasn't moved closer to the target
+            // in 120 ticks, it is blocked. FailSafe instead of looping forever.
+            int distSqNow = ctx.Vehicle.Position.DistanceToSquared(ctx.TargetWarehousePos);
+            int distSqLast = ctx.LastMovePos.DistanceToSquared(ctx.TargetWarehousePos);
+            if (distSqNow >= distSqLast)
+            {
+                ctx.StuckTicks++;
+                if (ctx.StuckTicks > 120)
+                {
+                    Log.Message($"[AutoVehicleHaul] MoveToWarehouse: Vehicle {ctx.Vehicle.LabelCap} stuck for {ctx.StuckTicks} ticks (distSq={distSqNow}). Failing safe.");
+                    TransitionState(ctx, VehicleState.FailSafe);
+                    return;
+                }
+            }
+            else
+            {
+                ctx.StuckTicks = 0;
+                ctx.LastMovePos = ctx.Vehicle.Position;
+            }
+
+            // Issue path if not moving — guard removed: previously required
+            // LastIssuedPathTarget != TargetWarehousePos, which prevented re-issue
+            // when a prior path ended without reaching the target.
             if (ctx.Vehicle.vehiclePather != null && !ctx.Vehicle.vehiclePather.Moving)
             {
-                if (ctx.LastIssuedPathTarget != ctx.TargetWarehousePos)
+                try
                 {
-                    try
-                    {
-                        var targetInfo = new LocalTargetInfo(ctx.TargetWarehousePos);
-                        ctx.Vehicle.vehiclePather.StartPath(targetInfo, Verse.AI.PathEndMode.Touch, true);
-                        ctx.LastIssuedPathTarget = ctx.TargetWarehousePos;
-                        Log.Message($"[AutoVehicleHaul] MoveToWarehouse: StartPath to {ctx.TargetWarehousePos}");
-                    }
-                    catch (System.Exception ex)
-                    {
-                        Log.Message($"[AutoVehicleHaul] MoveToWarehouse StartPath failed: {ex.Message}");
-                    }
+                    var targetInfo = new LocalTargetInfo(ctx.TargetWarehousePos);
+                    ctx.Vehicle.vehiclePather.StartPath(targetInfo, Verse.AI.PathEndMode.Touch, true);
+                    ctx.LastIssuedPathTarget = ctx.TargetWarehousePos;
+                    Log.Message($"[AutoVehicleHaul] MoveToWarehouse: StartPath to {ctx.TargetWarehousePos}");
+                }
+                catch (System.Exception ex)
+                {
+                    Log.Message($"[AutoVehicleHaul] MoveToWarehouse StartPath failed: {ex.Message}");
                 }
             }
         }
@@ -1152,13 +1234,16 @@ namespace AutoVehicleHaul
         }
 
         /// <summary>
-        /// Check if vehicle has arrived at the target position (distance squared <= 4).
+        /// Check if vehicle has arrived at the target position (same tile).
+        /// Previously <= 4 (2-cell Chebyshev radius) which caused false-positive
+        /// arrival when vehicle started 2 cells away — HasArrived fired before
+        /// StartPath ever ran, producing the "one step then stuck" symptom.
         /// </summary>
         private bool HasArrived(VehiclePawn vehicle, IntVec3 target)
         {
             if (vehicle == null)
                 return false;
-            return vehicle.Position.DistanceToSquared(target) <= 4;
+            return vehicle.Position.DistanceToSquared(target) <= 1;
         }
 
         /// <summary>

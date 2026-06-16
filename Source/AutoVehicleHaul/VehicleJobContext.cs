@@ -60,6 +60,8 @@ namespace AutoVehicleHaul
         public int TicksInState;
         public int CurrentJobTimeout;
         public int FailSafeCooldown;
+        public IntVec3 LastMovePos;
+        public int StuckTicks;
     }
 
     public readonly struct CargoPlan
