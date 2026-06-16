@@ -4,11 +4,15 @@ using Vehicles;
 using System.Linq;
 using RimWorld;
 using System.Collections.Generic;
+using System.Reflection;
 
 namespace AutoVehicleHaul
 {
     public class AutoVehicleHaulManager : MapComponent
     {
+        private static readonly FieldInfo IgnitionDraftedField =
+            typeof(VehicleIgnitionController).GetField("drafted", BindingFlags.NonPublic | BindingFlags.Instance);
+
         public AutoVehicleHaulManager(Map map) : base(map)
         {
             Log.Message("[AutoVehicleHaul] Constructor called");
@@ -45,12 +49,17 @@ namespace AutoVehicleHaul
 
             int candidateCount = 0;
             int filteredCount = 0;
+            int totalHaulableFound = 0;
+            int totalDesignatedForHaul = 0;
 
             string bestLabel = null;
             string bestVehicleLabel = null;
             float bestScore = float.MinValue;
 
             var topCandidates = new List<(Thing thing, VehiclePawn vehicle, float score)>();
+
+            // Phase 5 Diagnostic: Enumerate all designations on haulable things
+            int designationCount = 0;
 
             foreach (var thing in map.listerThings.AllThings)
             {
@@ -63,9 +72,51 @@ namespace AutoVehicleHaul
                 if (thing.stackCount <= 0)
                     continue;
 
-                float mass = thing.GetStatValue(StatDefOf.Mass);
-                if (mass < 25f)
+                if (!thing.def.EverHaulable)
                     continue;
+
+                totalHaulableFound++;
+
+                var designations = map.designationManager.AllDesignationsOn(thing);
+
+                foreach (var des in designations)
+                {
+                    designationCount++;
+                    Log.Message($"[AutoVehicleHaul] DESIGNATION | {thing.LabelCap} | {des.def.defName}");
+                }
+            }
+
+            Log.Message($"[AutoVehicleHaul] Total Designations Found: {designationCount}");
+
+            // Phase 5: Scan all things, filter by EverHaulable + haul designation
+            foreach (var thing in map.listerThings.AllThings)
+            {
+                if (!thing.Spawned)
+                    continue;
+
+                if (thing.def.category != ThingCategory.Item)
+                    continue;
+
+                if (thing.stackCount <= 0)
+                    continue;
+
+                if (!thing.def.EverHaulable)
+                    continue;
+
+                if (map.designationManager.DesignationOn(thing, DesignationDefOf.Haul) == null)
+                    continue;
+
+                totalDesignatedForHaul++;
+
+                float mass = thing.GetStatValue(StatDefOf.Mass);
+
+                // Designated haul items always qualify; mass filter only for auto-scan
+                if (mass < 25f)
+                {
+                    var haulDes = map.designationManager.DesignationOn(thing, DesignationDefOf.Haul);
+                    if (haulDes == null)
+                        continue;
+                }
 
                 if (idleVehicles.Count == 0)
                     continue;
@@ -148,13 +199,112 @@ namespace AutoVehicleHaul
                 }
             }
 
-            if (bestLabel != null)
+            // --- Phase 6: Vehicle Dispatch ---
+            // Use VehiclePather.StartPath() directly — no Job needed for movement proof.
+            // StartPath(LocalTargetInfo dest, PathEndMode peMode, Boolean ignoreReachability)
+            // PathEndMode.Touch = path to adjacent cell (vehicles are multi-cell, need to get close)
+            // This is a minimal proof: drive the vehicle to the target item's position.
+
+            Thing bestThing = null;
+            VehiclePawn bestVehicle = null;
+
+            if (top5.Count > 0)
             {
-                Log.Message($"[AutoVehicleHaul] Best Candidate: {bestLabel} | Vehicle: {bestVehicleLabel} | Score: {bestScore:F1}");
+                bestThing = top5[0].thing;
+                bestVehicle = top5[0].vehicle;
             }
 
+            if (bestThing != null && bestVehicle != null)
+            {
+                Log.Message($"[AutoVehicleHaul] === DISPATCH ===");
+                Log.Message($"[AutoVehicleHaul] Target: {bestThing.LabelCap} | Pos: {bestThing.Position}");
+                Log.Message($"[AutoVehicleHaul] Vehicle: {bestVehicle.LabelCap} | Pos: {bestVehicle.Position}");
+
+                // --- Phase 6a: Prerequisites Diagnostics ---
+                // Check all the requirements that StartPath and PatherTick enforce
+                bool drafted = bestVehicle.ignition != null && bestVehicle.ignition.Drafted;
+                bool canMove = bestVehicle.CanMove;
+                bool canMoveFinal = bestVehicle.CanMoveFinal;
+                bool hasEnoughOperators = bestVehicle.HasEnoughOperators;
+                int handlerCount = bestVehicle.handlers != null ? bestVehicle.handlers.Count : 0;
+                int movementHandlerCount = 0;
+                if (bestVehicle.handlers != null)
+                {
+                    foreach (var handler in bestVehicle.handlers)
+                    {
+                        if (handler != null && (handler.role.HandlingTypes & HandlingType.Movement) != 0)
+                        {
+                            movementHandlerCount++;
+                            bool roleFulfilled = handler.RoleFulfilled;
+                            int slotsToOperate = handler.role.SlotsToOperate;
+                            int thingOwnerCount = handler.thingOwner != null ? handler.thingOwner.Count : 0;
+                            Log.Message($"[AutoVehicleHaul]   Movement Handler: {handler.role.key} | SlotsToOperate: {slotsToOperate} | Occupied: {thingOwnerCount} | RoleFulfilled: {roleFulfilled}");
+                        }
+                    }
+                }
+
+                Log.Message($"[AutoVehicleHaul] Prerequisites: Drafted={drafted} | CanMove={canMove} | CanMoveFinal={canMoveFinal} | HasEnoughOperators={hasEnoughOperators} | Handlers={handlerCount} | MovementHandlers={movementHandlerCount}");
+
+                // --- Phase 6b: Force-Draft Vehicle ---
+                // StartPath requires vehicle.Drafted == true.
+                // CanDraft() requires HasEnoughOperators, which fails when Aboard == 0.
+                // We bypass CanDraft() by setting the private 'drafted' field directly via reflection.
+                // This is the key to enabling movement without a driver pawn aboard.
+                if (!drafted)
+                {
+                    Log.Message("[AutoVehicleHaul] Vehicle is NOT drafted. Attempting force-draft via reflection...");
+                    try
+                    {
+                        if (IgnitionDraftedField != null)
+                        {
+                            IgnitionDraftedField.SetValue(bestVehicle.ignition, true);
+                            Log.Message("[AutoVehicleHaul] Force-draft succeeded via reflection.");
+                        }
+                        else
+                        {
+                            Log.Message("[AutoVehicleHaul] ERROR: Could not find 'drafted' field in VehicleIgnitionController.");
+                        }
+                    }
+                    catch (System.Exception ex)
+                    {
+                        Log.Message($"[AutoVehicleHaul] Force-draft failed: {ex.GetType().Name}: {ex.Message}");
+                    }
+
+                    // Verify draft status after attempt
+                    bool draftedAfter = bestVehicle.ignition != null && bestVehicle.ignition.Drafted;
+                    Log.Message($"[AutoVehicleHaul] Drafted after force-draft attempt: {draftedAfter}");
+                }
+                else
+                {
+                    Log.Message("[AutoVehicleHaul] Vehicle is already drafted.");
+                }
+
+                // --- Phase 6c: Dispatch ---
+                try
+                {
+                    var targetInfo = new LocalTargetInfo(bestThing.Position);
+                    bestVehicle.vehiclePather.StartPath(targetInfo, Verse.AI.PathEndMode.Touch, true);
+
+                    Log.Message($"[AutoVehicleHaul] StartPath called | Dest: {bestThing.Position} | EndMode: Touch | IgnoreReachability: true");
+                    Log.Message($"[AutoVehicleHaul] Vehicle Moving: {bestVehicle.vehiclePather.Moving}");
+                    Log.Message($"[AutoVehicleHaul] Vehicle Destination: {bestVehicle.vehiclePather.Destination}");
+                    Log.Message($"[AutoVehicleHaul] === DISPATCH SUCCESS ===");
+                }
+                catch (System.Exception ex)
+                {
+                    Log.Message($"[AutoVehicleHaul] === DISPATCH FAILED ===");
+                    Log.Message($"[AutoVehicleHaul] Exception: {ex.GetType().Name}: {ex.Message}");
+                    Log.Message($"[AutoVehicleHaul] StackTrace: {ex.StackTrace}");
+                }
+            }
+            else
+            {
+                Log.Message("[AutoVehicleHaul] No valid candidate/vehicle pair for dispatch");
+            }
+
+            Log.Message($"[AutoVehicleHaul] Haulable Found: {totalHaulableFound}");
+            Log.Message($"[AutoVehicleHaul] Designated For Hauling: {totalDesignatedForHaul}");
             Log.Message($"[AutoVehicleHaul] Candidates After Filter: {candidateCount}");
-            Log.Message($"[AutoVehicleHaul] Candidates found: {candidateCount}");
         }
     }
 }
