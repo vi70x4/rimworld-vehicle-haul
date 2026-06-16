@@ -56,7 +56,9 @@ namespace AutoVehicleHaul
 
             if (!IsDriverStateValid(ctx))
             {
-                Log.Message($"[AutoVehicleHaul] WARNING: Driver state invalid for {ctx.Vehicle?.LabelCap}, state={ctx.State}");
+                Log.Message($"[AutoVehicleHaul] WARNING: Driver state invalid for {ctx.Vehicle?.LabelCap}, state={ctx.State}. Transitioning to FailSafe.");
+                TransitionState(ctx, VehicleState.FailSafe);
+                return;
             }
 
             switch (ctx.State)
@@ -459,6 +461,14 @@ namespace AutoVehicleHaul
                 return;
             }
 
+
+            // Timeout check
+            if (ctx.TicksInState > 600)
+            {
+                Log.Message($"[AutoVehicleHaul] MoveToPickup timeout (600 ticks). Failing safe.");
+                TransitionState(ctx, VehicleState.FailSafe);
+                return;
+            }
             // Check if vehicle has arrived at pickup position
             if (HasArrived(ctx.Vehicle, ctx.TargetPickupPos))
             {
@@ -494,7 +504,7 @@ namespace AutoVehicleHaul
         private void TickLoading(VehicleJobContext ctx)
         {
             // On entry: disembark driver, build cargo plan
-            if (ctx.TicksInState <= 1)
+            if (ctx.TicksInState == 0)
             {
                 DisembarkDriver(ctx);
                 ctx.SubState = LoadingSubState.Reserving;
@@ -652,33 +662,14 @@ namespace AutoVehicleHaul
             IntVec3 originalPos = item.Position;
             Map itemMap = item.Map;
 
-            try
+            if (TryStoreItem(ctx, item, originalPos, itemMap))
             {
-                item.DeSpawn();
-                bool added = ctx.Vehicle.inventory.innerContainer.TryAdd(item);
-
-                if (added)
-                {
-                    // Success: remove from reservedBy, increment count
-                    reservedBy.Remove(item);
-                    ctx.TransferredCount++;
-                    Log.Message($"[AutoVehicleHaul] Loading: {item.LabelCap} stored in vehicle. Transferred={ctx.TransferredCount}");
-                    ctx.SubState = LoadingSubState.ItemDone;
-                }
-                else
-                {
-                    // Failed to add to vehicle inventory — restore item to world
-                    GenSpawn.Spawn(item, originalPos, itemMap);
-                    Log.Message($"[AutoVehicleHaul] Loading: Failed to store {item.LabelCap} in vehicle. Restored to world.");
-                    ctx.SubState = LoadingSubState.StoringInVehicle;
-                    ctx.SubStateTicks = 0;
-                }
+                Log.Message($"[AutoVehicleHaul] Loading: {item.LabelCap} stored in vehicle. Transferred={ctx.TransferredCount}");
+                ctx.SubState = LoadingSubState.ItemDone;
             }
-            catch (System.Exception ex)
+            else
             {
-                // Restore item on exception
-                try { GenSpawn.Spawn(item, originalPos, itemMap); } catch { }
-                Log.Message($"[AutoVehicleHaul] Loading: Exception storing {item.LabelCap}: {ex.Message}. Restored to world.");
+                Log.Message($"[AutoVehicleHaul] Loading: Failed to store {item.LabelCap} in vehicle. Restored to world.");
                 ctx.SubState = LoadingSubState.StoringInVehicle;
                 ctx.SubStateTicks = 0;
             }
@@ -718,29 +709,14 @@ namespace AutoVehicleHaul
                 IntVec3 originalPos = item.Position;
                 Map itemMap = item.Map;
 
-                try
+                if (TryStoreItem(ctx, item, originalPos, itemMap))
                 {
-                    item.DeSpawn();
-                    bool added = ctx.Vehicle.inventory.innerContainer.TryAdd(item);
-
-                    if (added)
-                    {
-                        reservedBy.Remove(item);
-                        ctx.TransferredCount++;
-                        Log.Message($"[AutoVehicleHaul] Loading: {item.LabelCap} stored via StoringInVehicle. Transferred={ctx.TransferredCount}");
-                        ctx.SubState = LoadingSubState.ItemDone;
-                    }
-                    else
-                    {
-                        GenSpawn.Spawn(item, originalPos, itemMap);
-                        Log.Message($"[AutoVehicleHaul] Loading: StoringInVehicle failed for {item.LabelCap}. Item done (will retry next job).");
-                        ctx.SubState = LoadingSubState.ItemDone;
-                    }
+                    Log.Message($"[AutoVehicleHaul] Loading: {item.LabelCap} stored via StoringInVehicle. Transferred={ctx.TransferredCount}");
+                    ctx.SubState = LoadingSubState.ItemDone;
                 }
-                catch (System.Exception ex)
+                else
                 {
-                    try { GenSpawn.Spawn(item, originalPos, itemMap); } catch { }
-                    Log.Message($"[AutoVehicleHaul] Loading: StoringInVehicle exception: {ex.Message}.");
+                    Log.Message($"[AutoVehicleHaul] Loading: StoringInVehicle failed for {item.LabelCap}. Item done (will retry next job).");
                     ctx.SubState = LoadingSubState.ItemDone;
                 }
                 return;
@@ -822,6 +798,14 @@ namespace AutoVehicleHaul
                 return;
             }
 
+
+            // Timeout check
+            if (ctx.TicksInState > 600)
+            {
+                Log.Message($"[AutoVehicleHaul] MoveToWarehouse timeout (600 ticks). Failing safe.");
+                TransitionState(ctx, VehicleState.FailSafe);
+                return;
+            }
             // On entry: find warehouse if not set
             if (ctx.TargetWarehousePos == IntVec3.Zero)
             {
@@ -890,7 +874,7 @@ namespace AutoVehicleHaul
         private void TickUnloading(VehicleJobContext ctx)
         {
             // On entry: disembark driver
-            if (ctx.TicksInState <= 1)
+            if (ctx.TicksInState == 0)
             {
                 DisembarkDriver(ctx);
                 Log.Message($"[AutoVehicleHaul] Unloading: Driver disembarked.");
@@ -946,7 +930,7 @@ namespace AutoVehicleHaul
         private void TickFailSafe(VehicleJobContext ctx)
         {
             // On entry: release reservations, re-embark driver, undraft, remove context
-            if (ctx.TicksInState <= 1)
+            if (ctx.TicksInState == 0)
             {
                 Log.Message($"[AutoVehicleHaul] FailSafe entered for {ctx.Vehicle?.LabelCap}. Releasing reservations.");
 
@@ -979,6 +963,37 @@ namespace AutoVehicleHaul
             {
                 Log.Message($"[AutoVehicleHaul] FailSafe cooldown expired. Returning to IdleScan.");
                 // Context is already removed from jobContexts; vehicle will be picked up by next scan
+            }
+        }
+
+        /// <summary>
+        /// Try to store an item in the vehicle inventory. Handles DeSpawn + TryAdd + restore-on-fail.
+        /// Returns true if successfully stored, false otherwise.
+        /// </summary>
+        private bool TryStoreItem(VehicleJobContext ctx, Thing item, IntVec3 originalPos, Map itemMap)
+        {
+            try
+            {
+                item.DeSpawn();
+                bool added = ctx.Vehicle.inventory.innerContainer.TryAdd(item);
+
+                if (added)
+                {
+                    reservedBy.Remove(item);
+                    ctx.TransferredCount++;
+                    return true;
+                }
+                else
+                {
+                    GenSpawn.Spawn(item, originalPos, itemMap);
+                    return false;
+                }
+            }
+            catch (System.Exception ex)
+            {
+                try { GenSpawn.Spawn(item, originalPos, itemMap); } catch { }
+                Log.Message($"[AutoVehicleHaul] Loading: Exception storing {item.LabelCap}: {ex.Message}. Restored to world.");
+                return false;
             }
         }
 
@@ -1033,6 +1048,7 @@ namespace AutoVehicleHaul
         /// <summary>
         /// Build a cargo plan: scan for haul-designated items near the vehicle,
         /// filter out reserved items, score them, and return a readonly CargoPlan.
+        /// Note: Warehouse position is resolved later in MoveToWarehouse, not here.
         /// </summary>
         private CargoPlan BuildCargoPlan(VehiclePawn vehicle, IntVec3 pickupPos, int radius)
         {
@@ -1064,27 +1080,8 @@ namespace AutoVehicleHaul
             // Score and sort items by mass (heaviest first for efficient loading)
             items.Sort((a, b) => b.Mass.CompareTo(a.Mass));
 
-            // Find warehouse position
-            IntVec3 warehousePos = IntVec3.Zero;
-            var stockpiles = map.zoneManager.AllZones.Where(z => z is Zone_Stockpile).ToList();
-            if (stockpiles.Count > 0)
-            {
-                int bestDistSq = int.MaxValue;
-                foreach (var zone in stockpiles)
-                {
-                    foreach (var cell in zone.Cells)
-                    {
-                        int d = cell.DistanceToSquared(vehicle.Position);
-                        if (d < bestDistSq)
-                        {
-                            bestDistSq = d;
-                            warehousePos = cell;
-                        }
-                    }
-                }
-            }
 
-            return new CargoPlan(items, vehicle, pickupPos, warehousePos);
+            return new CargoPlan(items, vehicle, pickupPos, IntVec3.Zero);
         }
 
         /// <summary>
