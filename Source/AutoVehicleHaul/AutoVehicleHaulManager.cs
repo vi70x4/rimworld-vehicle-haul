@@ -18,6 +18,7 @@ namespace AutoVehicleHaul
             {
                 return;
             }
+            Log.Message("[AutoVehicleHaul] Scan tick running");
 
             var vehicles = map.mapPawns.AllPawnsSpawned.Where(p => p is VehiclePawn).Cast<VehiclePawn>().ToList();
 
@@ -38,6 +39,7 @@ namespace AutoVehicleHaul
             }
 
             Log.Message($"[AutoVehicleHaul] Total vehicles: {vehicles.Count} | Idle: {idleCount}");
+            Log.Message($"[AutoVehicleHaul] Idle vehicles found: {idleVehicles.Count}");
 
             int candidateCount = 0;
 
@@ -119,6 +121,7 @@ namespace AutoVehicleHaul
                 Log.Message($"[AutoVehicleHaul] Best Candidate: {bestLabel} | Vehicle: {bestVehicleLabel} | Score: {bestScore:F1}");
             }
 
+            Log.Message($"[AutoVehicleHaul] Candidates found: {candidateCount}");
             Log.Message($"[AutoVehicleHaul] Candidates scanned: {candidateCount}");
         }
     }

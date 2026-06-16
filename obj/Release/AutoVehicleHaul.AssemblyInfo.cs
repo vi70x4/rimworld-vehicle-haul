@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("AutoVehicleHaul")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+adfce7e6377c5f6fd638a670b940f1aea65e81f5")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+cdc547154ec5e6a4142ee3e934676b9a177d6f00")]
 [assembly: System.Reflection.AssemblyProductAttribute("AutoVehicleHaul")]
 [assembly: System.Reflection.AssemblyTitleAttribute("AutoVehicleHaul")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
