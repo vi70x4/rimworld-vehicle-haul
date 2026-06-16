@@ -4,14 +4,15 @@ using Vehicles;
 using System.Linq;
 using RimWorld;
 using System.Collections.Generic;
-using System.Reflection;
 
 namespace AutoVehicleHaul
 {
     public class AutoVehicleHaulManager : MapComponent
-    {
-        private static readonly FieldInfo IgnitionDraftedField =
-            typeof(VehicleIgnitionController).GetField("drafted", BindingFlags.NonPublic | BindingFlags.Instance);
+ {
+        /// <summary>
+        /// Tracks which pawn was assigned as driver for which vehicle, so we can disembark on completion.
+        /// </summary>
+        private static readonly Dictionary<VehiclePawn, Pawn> assignedDrivers = new Dictionary<VehiclePawn, Pawn>();
 
         public AutoVehicleHaulManager(Map map) : base(map)
         {
@@ -26,6 +27,30 @@ namespace AutoVehicleHaul
             }
             Log.Message("[AutoVehicleHaul] Scan tick running");
 
+            // --- Cleanup: disembark drivers from vehicles that are no longer moving ---
+            var toRemove = new List<VehiclePawn>();
+            foreach (var kvp in assignedDrivers)
+            {
+                VehiclePawn vehicle = kvp.Key;
+                Pawn driver = kvp.Value;
+                if (vehicle == null || vehicle.Destroyed || !vehicle.Spawned)
+                {
+                    toRemove.Add(vehicle);
+                    continue;
+                }
+                // Once vehicle reaches destination (no longer moving), disembark driver
+                if (!vehicle.vehiclePather.Moving)
+                {
+                    Log.Message($"[AutoVehicleHaul] Vehicle {vehicle.LabelCap} stopped moving. Disembarking driver {driver.LabelCap}.");
+                    vehicle.DisembarkPawn(driver);
+                    toRemove.Add(vehicle);
+                }
+            }
+            foreach (var v in toRemove)
+            {
+                assignedDrivers.Remove(v);
+            }
+
             var vehicles = map.mapPawns.AllPawnsSpawned.Where(p => p is VehiclePawn).Cast<VehiclePawn>().ToList();
 
             int idleCount = 0;
@@ -35,7 +60,7 @@ namespace AutoVehicleHaul
             {
                 string patherStatus = vehicle.vehiclePather == null ? "null pather" : vehicle.vehiclePather.Moving.ToString();
 
-                Log.Message($"[AutoVehicleHaul] Vehicle: {vehicle.LabelCap} | Pos: {vehicle.Position} | Moving: {patherStatus} | CanMove: {vehicle.CanMove} | Aboard: {vehicle.AllPawnsAboard.Count}");
+                Log.Message($"[AutoVehicleHaul] Vehicle: {vehicle.LabelCap} | Pos: {vehicle.Position} | Moving: {patherStatus} | CanMove: {vehicle.CanMove} | CanMoveFinal: {vehicle.CanMoveFinal} | Aboard: {vehicle.AllPawnsAboard.Count}");
 
                 if (vehicle.vehiclePather != null && !vehicle.vehiclePather.Moving && vehicle.CanMove)
                 {
@@ -199,12 +224,7 @@ namespace AutoVehicleHaul
                 }
             }
 
-            // --- Phase 6: Vehicle Dispatch ---
-            // Use VehiclePather.StartPath() directly — no Job needed for movement proof.
-            // StartPath(LocalTargetInfo dest, PathEndMode peMode, Boolean ignoreReachability)
-            // PathEndMode.Touch = path to adjacent cell (vehicles are multi-cell, need to get close)
-            // This is a minimal proof: drive the vehicle to the target item's position.
-
+            // --- Phase 6: Vehicle Dispatch with Real Driver Assignment ---
             Thing bestThing = null;
             VehiclePawn bestVehicle = null;
 
@@ -221,13 +241,13 @@ namespace AutoVehicleHaul
                 Log.Message($"[AutoVehicleHaul] Vehicle: {bestVehicle.LabelCap} | Pos: {bestVehicle.Position}");
 
                 // --- Phase 6a: Prerequisites Diagnostics ---
-                // Check all the requirements that StartPath and PatherTick enforce
                 bool drafted = bestVehicle.ignition != null && bestVehicle.ignition.Drafted;
                 bool canMove = bestVehicle.CanMove;
                 bool canMoveFinal = bestVehicle.CanMoveFinal;
                 bool hasEnoughOperators = bestVehicle.HasEnoughOperators;
                 int handlerCount = bestVehicle.handlers != null ? bestVehicle.handlers.Count : 0;
                 int movementHandlerCount = 0;
+                VehicleRoleHandler movementRoleHandler = null;
                 if (bestVehicle.handlers != null)
                 {
                     foreach (var handler in bestVehicle.handlers)
@@ -235,6 +255,7 @@ namespace AutoVehicleHaul
                         if (handler != null && (handler.role.HandlingTypes & HandlingType.Movement) != 0)
                         {
                             movementHandlerCount++;
+                            movementRoleHandler = handler;
                             bool roleFulfilled = handler.RoleFulfilled;
                             int slotsToOperate = handler.role.SlotsToOperate;
                             int thingOwnerCount = handler.thingOwner != null ? handler.thingOwner.Count : 0;
@@ -245,56 +266,91 @@ namespace AutoVehicleHaul
 
                 Log.Message($"[AutoVehicleHaul] Prerequisites: Drafted={drafted} | CanMove={canMove} | CanMoveFinal={canMoveFinal} | HasEnoughOperators={hasEnoughOperators} | Handlers={handlerCount} | MovementHandlers={movementHandlerCount}");
 
-                // --- Phase 6b: Force-Draft Vehicle ---
-                // StartPath requires vehicle.Drafted == true.
-                // CanDraft() requires HasEnoughOperators, which fails when Aboard == 0.
-                // We bypass CanDraft() by setting the private 'drafted' field directly via reflection.
-                // This is the key to enabling movement without a driver pawn aboard.
-                if (!drafted)
+                // --- Phase 6b: Assign Driver ---
+                // Instead of force-drafting via reflection, we assign a real colonist to the
+                // vehicle's movement handler. This satisfies VehicleFramework's invariants:
+                //   HasEnoughOperators → true (real pawn in driver role)
+                //   CanMoveFinal → true (CanMove && HasEnoughOperators)
+                //   CanDraft() → true (HasEnoughOperators satisfied)
+                //   StartPath → succeeds (Drafted check passes)
+                //   PatherTick → continues (CanMoveFinal check passes)
+                if (!hasEnoughOperators && movementRoleHandler != null)
                 {
-                    Log.Message("[AutoVehicleHaul] Vehicle is NOT drafted. Attempting force-draft via reflection...");
-                    try
+                    Log.Message("[AutoVehicleHaul] No operator assigned. Finding a driver...");
+                    Pawn driver = FindBestDriver(bestVehicle, map);
+                    if (driver != null)
                     {
-                        if (IgnitionDraftedField != null)
+                        Log.Message($"[AutoVehicleHaul] Selected driver: {driver.LabelCap} | Pos: {driver.Position}");
+                        bool assigned = bestVehicle.TryAddPawn(driver, movementRoleHandler);
+                        if (assigned)
                         {
-                            IgnitionDraftedField.SetValue(bestVehicle.ignition, true);
-                            Log.Message("[AutoVehicleHaul] Force-draft succeeded via reflection.");
+                            Log.Message($"[AutoVehicleHaul] Driver {driver.LabelCap} assigned to {bestVehicle.LabelCap}.");
+                            Log.Message($"[AutoVehicleHaul] HasEnoughOperators={bestVehicle.HasEnoughOperators} | CanMoveFinal={bestVehicle.CanMoveFinal} | Aboard={bestVehicle.AllPawnsAboard.Count}");
+                            // Track for cleanup
+                            assignedDrivers[bestVehicle] = driver;
                         }
                         else
                         {
-                            Log.Message("[AutoVehicleHaul] ERROR: Could not find 'drafted' field in VehicleIgnitionController.");
+                            Log.Message($"[AutoVehicleHaul] WARNING: TryAddPawn failed for {driver.LabelCap} on {bestVehicle.LabelCap}.");
                         }
                     }
-                    catch (System.Exception ex)
+                    else
                     {
-                        Log.Message($"[AutoVehicleHaul] Force-draft failed: {ex.GetType().Name}: {ex.Message}");
+                        Log.Message("[AutoVehicleHaul] WARNING: No suitable driver found on map.");
                     }
+                }
+                else if (hasEnoughOperators)
+                {
+                    Log.Message("[AutoVehicleHaul] Vehicle already has sufficient operators.");
+                }
+                else
+                {
+                    Log.Message("[AutoVehicleHaul] WARNING: No movement handler found on vehicle, cannot assign driver.");
+                }
 
-                    // Verify draft status after attempt
-                    bool draftedAfter = bestVehicle.ignition != null && bestVehicle.ignition.Drafted;
-                    Log.Message($"[AutoVehicleHaul] Drafted after force-draft attempt: {draftedAfter}");
+                // --- Phase 6c: Draft Vehicle ---
+                // Now that HasEnoughOperators is satisfied, CanDraft() will succeed.
+                // We draft normally through the framework API — no reflection needed.
+                if (!drafted)
+                {
+                    if (bestVehicle.HasEnoughOperators)
+                    {
+                        bestVehicle.ignition.Drafted = true;
+                        Log.Message($"[AutoVehicleHaul] Vehicle drafted via framework API. Drafted={bestVehicle.ignition.Drafted}");
+                    }
+                    else
+                    {
+                        Log.Message("[AutoVehicleHaul] Cannot draft: HasEnoughOperators still false after driver assignment attempt.");
+                    }
                 }
                 else
                 {
                     Log.Message("[AutoVehicleHaul] Vehicle is already drafted.");
                 }
 
-                // --- Phase 6c: Dispatch ---
-                try
+                // --- Phase 6d: Dispatch ---
+                if (bestVehicle.ignition != null && bestVehicle.ignition.Drafted && bestVehicle.CanMoveFinal)
                 {
-                    var targetInfo = new LocalTargetInfo(bestThing.Position);
-                    bestVehicle.vehiclePather.StartPath(targetInfo, Verse.AI.PathEndMode.Touch, true);
+                    try
+                    {
+                        var targetInfo = new LocalTargetInfo(bestThing.Position);
+                        bestVehicle.vehiclePather.StartPath(targetInfo, Verse.AI.PathEndMode.Touch, true);
 
-                    Log.Message($"[AutoVehicleHaul] StartPath called | Dest: {bestThing.Position} | EndMode: Touch | IgnoreReachability: true");
-                    Log.Message($"[AutoVehicleHaul] Vehicle Moving: {bestVehicle.vehiclePather.Moving}");
-                    Log.Message($"[AutoVehicleHaul] Vehicle Destination: {bestVehicle.vehiclePather.Destination}");
-                    Log.Message($"[AutoVehicleHaul] === DISPATCH SUCCESS ===");
+                        Log.Message($"[AutoVehicleHaul] StartPath called | Dest: {bestThing.Position} | EndMode: Touch | IgnoreReachability: true");
+                        Log.Message($"[AutoVehicleHaul] Vehicle Moving: {bestVehicle.vehiclePather.Moving}");
+                        Log.Message($"[AutoVehicleHaul] Vehicle Destination: {bestVehicle.vehiclePather.Destination}");
+                        Log.Message($"[AutoVehicleHaul] === DISPATCH SUCCESS ===");
+                    }
+                    catch (System.Exception ex)
+                    {
+                        Log.Message($"[AutoVehicleHaul] === DISPATCH FAILED ===");
+                        Log.Message($"[AutoVehicleHaul] Exception: {ex.GetType().Name}: {ex.Message}");
+                        Log.Message($"[AutoVehicleHaul] StackTrace: {ex.StackTrace}");
+                    }
                 }
-                catch (System.Exception ex)
+                else
                 {
-                    Log.Message($"[AutoVehicleHaul] === DISPATCH FAILED ===");
-                    Log.Message($"[AutoVehicleHaul] Exception: {ex.GetType().Name}: {ex.Message}");
-                    Log.Message($"[AutoVehicleHaul] StackTrace: {ex.StackTrace}");
+                    Log.Message($"[AutoVehicleHaul] Cannot dispatch: Drafted={bestVehicle.ignition?.Drafted} | CanMoveFinal={bestVehicle.CanMoveFinal}");
                 }
             }
             else
@@ -305,6 +361,56 @@ namespace AutoVehicleHaul
             Log.Message($"[AutoVehicleHaul] Haulable Found: {totalHaulableFound}");
             Log.Message($"[AutoVehicleHaul] Designated For Hauling: {totalDesignatedForHaul}");
             Log.Message($"[AutoVehicleHaul] Candidates After Filter: {candidateCount}");
+        }
+
+        /// <summary>
+        /// Find the best available colonist to serve as a vehicle driver.
+        /// Prioritizes: not downed, not dead, not in mental state, capable of manipulation and consciousness,
+        /// spawned on map, same faction, not already in a vehicle. Closest to vehicle by position.
+        /// </summary>
+        private Pawn FindBestDriver(VehiclePawn vehicle, Map map)
+        {
+            VehicleRoleHandler movementRoleHandler = null;
+            if (vehicle.handlers != null)
+            {
+                foreach (var h in vehicle.handlers)
+                {
+                    if (h != null && (h.role.HandlingTypes & HandlingType.Movement) != 0)
+                    {
+                        movementRoleHandler = h;
+                        break;
+                    }
+                }
+            }
+
+            if (movementRoleHandler == null)
+            {
+                Log.Message("[AutoVehicleHaul] No movement handler found, cannot evaluate drivers.");
+                return null;
+            }
+
+            Pawn bestDriver = null;
+            int bestDistSq = int.MaxValue;
+
+            foreach (Pawn pawn in map.mapPawns.FreeColonistsSpawned)
+            {
+                // Must be capable of operating the role
+                if (!movementRoleHandler.CanOperateRole(pawn))
+                    continue;
+
+                // Must not already be in a vehicle
+                if (pawn.InVehicle())
+                    continue;
+
+                int distSq = pawn.Position.DistanceToSquared(vehicle.Position);
+                if (distSq < bestDistSq)
+                {
+                    bestDistSq = distSq;
+                    bestDriver = pawn;
+                }
+            }
+
+            return bestDriver;
         }
     }
 }
