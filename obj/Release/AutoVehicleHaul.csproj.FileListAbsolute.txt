@@ -7,3 +7,4 @@
 /home/vi/rimworld-vehicle-haul/obj/Release/AutoVehicleHaul.csproj.CoreCompileInputs.cache
 /home/vi/rimworld-vehicle-haul/obj/Release/AutoVehicleHaul.dll
 /home/vi/rimworld-vehicle-haul/obj/Release/AutoVehicleHaul.pdb
+/home/vi/rimworld-vehicle-haul/obj/Release/AutoVehicleHaul.sourcelink.json
