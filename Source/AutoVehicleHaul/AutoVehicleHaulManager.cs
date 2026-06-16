@@ -461,6 +461,21 @@ namespace AutoVehicleHaul
                 return;
             }
 
+            // Driver death/injury check
+            if (!DriverExists(ctx))
+            {
+                Log.Message("[AutoVehicleHaul] MoveToPickup: Driver missing! Failing safe.");
+                TransitionState(ctx, VehicleState.FailSafe);
+                return;
+            }
+
+            // Undrivered vehicle recovery: if vehicle lost its operator mid-transit
+            if (ctx.Vehicle.HasEnoughOperators == false)
+            {
+                Log.Message("[AutoVehicleHaul] MoveToPickup: Vehicle lost its operator! Failing safe.");
+                TransitionState(ctx, VehicleState.FailSafe);
+                return;
+            }
 
             // Timeout check
             if (ctx.TicksInState > 600)
@@ -512,6 +527,14 @@ namespace AutoVehicleHaul
                 ctx.CurrentItemIndex = 0;
                 ctx.TransferredCount = 0;
                 Log.Message($"[AutoVehicleHaul] Loading: Driver disembarked. Starting sub-FSM.");
+            }
+
+            // Vehicle destruction check
+            if (ctx.Vehicle == null || ctx.Vehicle.Destroyed)
+            {
+                Log.Message("[AutoVehicleHaul] Loading: Vehicle destroyed! Failing safe.");
+                TransitionState(ctx, VehicleState.FailSafe);
+                return;
             }
 
             // Timeout check
@@ -745,6 +768,8 @@ namespace AutoVehicleHaul
             {
                 // All items processed
                 Log.Message($"[AutoVehicleHaul] Loading: All items done. Transferred={ctx.TransferredCount}. Moving to warehouse.");
+                // Release any remaining reservations before transitioning
+                ReleaseReservations(ctx);
                 ReembarkDriver(ctx);
                 TransitionState(ctx, VehicleState.MoveToWarehouse);
             }
@@ -775,6 +800,8 @@ namespace AutoVehicleHaul
             {
                 // All items processed (some may have failed)
                 Log.Message($"[AutoVehicleHaul] Loading: All items processed (some failed). Transferred={ctx.TransferredCount}. Moving to warehouse.");
+                // Release any remaining reservations before transitioning
+                ReleaseReservations(ctx);
                 ReembarkDriver(ctx);
                 TransitionState(ctx, VehicleState.MoveToWarehouse);
             }
@@ -798,6 +825,13 @@ namespace AutoVehicleHaul
                 return;
             }
 
+            // Driver death/injury check
+            if (!DriverExists(ctx))
+            {
+                Log.Message("[AutoVehicleHaul] MoveToWarehouse: Driver missing! Failing safe.");
+                TransitionState(ctx, VehicleState.FailSafe);
+                return;
+            }
 
             // Timeout check
             if (ctx.TicksInState > 600)
@@ -880,6 +914,14 @@ namespace AutoVehicleHaul
                 Log.Message($"[AutoVehicleHaul] Unloading: Driver disembarked.");
             }
 
+            // Vehicle destruction check
+            if (ctx.Vehicle == null || ctx.Vehicle.Destroyed)
+            {
+                Log.Message("[AutoVehicleHaul] Unloading: Vehicle destroyed! Failing safe.");
+                TransitionState(ctx, VehicleState.FailSafe);
+                return;
+            }
+
             // Safety check: driver must exist
             if (!DriverExists(ctx))
             {
@@ -900,6 +942,8 @@ namespace AutoVehicleHaul
             if (ctx.Vehicle.inventory.innerContainer.Count == 0)
             {
                 Log.Message($"[AutoVehicleHaul] Unloading: Vehicle inventory empty. Job complete.");
+                // Release any remaining reservations before completing
+                ReleaseReservations(ctx);
                 ReembarkDriver(ctx);
                 // Remove job context
                 jobContexts.Remove(ctx.Vehicle);
@@ -930,27 +974,42 @@ namespace AutoVehicleHaul
         private void TickFailSafe(VehicleJobContext ctx)
         {
             // On entry: release reservations, re-embark driver, undraft, remove context
+            // Each step is wrapped in try-catch to prevent cascading failures
             if (ctx.TicksInState == 0)
             {
                 Log.Message($"[AutoVehicleHaul] FailSafe entered for {ctx.Vehicle?.LabelCap}. Releasing reservations.");
 
                 // Release all reservations held by this context
-                ReleaseReservations(ctx);
+                try { ReleaseReservations(ctx); }
+                catch (System.Exception ex) { Log.Message($"[AutoVehicleHaul] FailSafe: Exception releasing reservations: {ex.Message}"); }
 
-                // Re-embark driver
-                ReembarkDriver(ctx);
-
-                // Undraft vehicle
-                if (ctx.Vehicle != null && ctx.Vehicle.ignition != null)
+                // Re-embark driver (skip if driver is null/dead)
+                try
                 {
-                    ctx.Vehicle.ignition.Drafted = false;
+                    if (DriverExists(ctx))
+                        ReembarkDriver(ctx);
+                    else
+                        Log.Message("[AutoVehicleHaul] FailSafe: Driver not available, skipping re-embark.");
                 }
+                catch (System.Exception ex) { Log.Message($"[AutoVehicleHaul] FailSafe: Exception re-embarking driver: {ex.Message}"); }
+
+                // Undraft vehicle (skip if vehicle is null)
+                try
+                {
+                    if (ctx.Vehicle != null && ctx.Vehicle.ignition != null)
+                        ctx.Vehicle.ignition.Drafted = false;
+                    else
+                        Log.Message("[AutoVehicleHaul] FailSafe: Vehicle or ignition null, skipping undraft.");
+                }
+                catch (System.Exception ex) { Log.Message($"[AutoVehicleHaul] FailSafe: Exception undrafting vehicle: {ex.Message}"); }
 
                 // Remove job context
-                if (ctx.Vehicle != null)
+                try
                 {
-                    jobContexts.Remove(ctx.Vehicle);
+                    if (ctx.Vehicle != null)
+                        jobContexts.Remove(ctx.Vehicle);
                 }
+                catch (System.Exception ex) { Log.Message($"[AutoVehicleHaul] FailSafe: Exception removing job context: {ex.Message}"); }
 
                 ctx.FailSafeCooldown = 250;
                 Log.Message($"[AutoVehicleHaul] FailSafe: Cooldown set to {ctx.FailSafeCooldown} ticks.");
@@ -1054,6 +1113,8 @@ namespace AutoVehicleHaul
         {
             var items = new List<HaulItem>();
             float radiusSq = radius * radius;
+            float maxCapacity = 500f; // Max total mass per haul trip
+            float runningMass = 0f;
 
             foreach (var thing in map.listerThings.AllThings)
             {
@@ -1073,6 +1134,12 @@ namespace AutoVehicleHaul
                 if (thing.Position.DistanceToSquared(pickupPos) <= radiusSq)
                 {
                     float mass = thing.GetStatValue(StatDefOf.Mass);
+
+                    // Capacity-aware: skip items that would exceed vehicle capacity
+                    if (runningMass + mass > maxCapacity)
+                        continue;
+
+                    runningMass += mass;
                     items.Add(new HaulItem(thing, thing.Position, mass));
                 }
             }
@@ -1196,6 +1263,12 @@ namespace AutoVehicleHaul
         /// </summary>
         private void TransitionState(VehicleJobContext ctx, VehicleState newState)
         {
+            // Anti-oscillation guard: prevent transitioning back to the same state too quickly
+            if (newState == ctx.LastState && ctx.TicksSinceLastTransition < 120)
+            {
+                Log.Message($"[AutoVehicleHaul] WARNING: Anti-oscillation guard blocked transition to {newState} (LastState={ctx.LastState}, TicksSinceLastTransition={ctx.TicksSinceLastTransition})");
+                return;
+            }
             ctx.LastState = ctx.State;
             ctx.State = newState;
             ctx.TicksInState = 0;
