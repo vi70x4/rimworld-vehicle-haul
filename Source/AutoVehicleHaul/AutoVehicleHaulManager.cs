@@ -1,7 +1,9 @@
+using UnityEngine;
 using Verse;
 using Vehicles;
 using System.Linq;
 using RimWorld;
+using System.Collections.Generic;
 
 namespace AutoVehicleHaul
 {
@@ -23,7 +25,7 @@ namespace AutoVehicleHaul
             var vehicles = map.mapPawns.AllPawnsSpawned.Where(p => p is VehiclePawn).Cast<VehiclePawn>().ToList();
 
             int idleCount = 0;
-            var idleVehicles = new System.Collections.Generic.List<VehiclePawn>();
+            var idleVehicles = new List<VehiclePawn>();
 
             foreach (var vehicle in vehicles)
             {
@@ -42,10 +44,13 @@ namespace AutoVehicleHaul
             Log.Message($"[AutoVehicleHaul] Idle vehicles found: {idleVehicles.Count}");
 
             int candidateCount = 0;
+            int filteredCount = 0;
 
             string bestLabel = null;
             string bestVehicleLabel = null;
             float bestScore = float.MinValue;
+
+            var topCandidates = new List<(Thing thing, VehiclePawn vehicle, float score)>();
 
             foreach (var thing in map.listerThings.AllThings)
             {
@@ -81,9 +86,11 @@ namespace AutoVehicleHaul
                 if (nearest == null)
                     continue;
 
-                // --- Phase 3: Logistics Scoring ---
+                // --- Phase 4: Stabilized Logistics Scoring ---
                 float massScore = mass;
-                float distancePenalty = bestDistSq * 0.05f;
+
+                float distance = Mathf.Sqrt(bestDistSq);
+                float distancePenalty = distance * 0.5f;
 
                 float resourceBonus = 0f;
                 string defName = thing.def.defName.ToLower();
@@ -104,7 +111,20 @@ namespace AutoVehicleHaul
 
                 float finalScore = massScore - distancePenalty + resourceBonus + vehicleFit;
 
-                Log.Message($"[AutoVehicleHaul] Candidate: {thing.LabelCap} | Vehicle: {nearest.LabelCap} | Score: {finalScore:F1} | DistSq: {bestDistSq}");
+                // Clamp score to prevent extreme outliers
+                finalScore = Mathf.Clamp(finalScore, -100f, 200f);
+
+                // Minimum viability threshold
+                if (finalScore < -50f)
+                {
+                    filteredCount++;
+                    continue;
+                }
+
+                candidateCount++;
+
+                // Track top 5 candidates
+                topCandidates.Add((thing, nearest, finalScore));
 
                 if (finalScore > bestScore)
                 {
@@ -112,8 +132,20 @@ namespace AutoVehicleHaul
                     bestLabel = thing.LabelCap;
                     bestVehicleLabel = nearest.LabelCap;
                 }
+            }
 
-                candidateCount++;
+            // Sort top candidates descending by score, take top 5
+            topCandidates.Sort((a, b) => b.score.CompareTo(a.score));
+            var top5 = topCandidates.Take(5).ToList();
+
+            if (top5.Count > 0)
+            {
+                Log.Message("[AutoVehicleHaul] TOP CANDIDATES:");
+                for (int i = 0; i < top5.Count; i++)
+                {
+                    var entry = top5[i];
+                    Log.Message($"[AutoVehicleHaul] {i + 1}. {entry.thing.LabelCap} | Vehicle: {entry.vehicle.LabelCap} | Score: {entry.score:F1}");
+                }
             }
 
             if (bestLabel != null)
@@ -121,8 +153,8 @@ namespace AutoVehicleHaul
                 Log.Message($"[AutoVehicleHaul] Best Candidate: {bestLabel} | Vehicle: {bestVehicleLabel} | Score: {bestScore:F1}");
             }
 
+            Log.Message($"[AutoVehicleHaul] Candidates After Filter: {candidateCount}");
             Log.Message($"[AutoVehicleHaul] Candidates found: {candidateCount}");
-            Log.Message($"[AutoVehicleHaul] Candidates scanned: {candidateCount}");
         }
     }
 }
