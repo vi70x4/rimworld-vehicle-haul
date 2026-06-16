@@ -41,6 +41,10 @@ namespace AutoVehicleHaul
 
             int candidateCount = 0;
 
+            string bestLabel = null;
+            string bestVehicleLabel = null;
+            float bestScore = float.MinValue;
+
             foreach (var thing in map.listerThings.AllThings)
             {
                 if (!thing.Spawned)
@@ -72,11 +76,47 @@ namespace AutoVehicleHaul
                     }
                 }
 
-                if (nearest != null)
+                if (nearest == null)
+                    continue;
+
+                // --- Phase 3: Logistics Scoring ---
+                float massScore = mass;
+                float distancePenalty = bestDistSq * 0.05f;
+
+                float resourceBonus = 0f;
+                string defName = thing.def.defName.ToLower();
+                if (defName.Contains("slag") || defName.Contains("steel") || defName.Contains("component"))
                 {
-                    Log.Message($"[AutoVehicleHaul] Candidate: {thing.LabelCap} | Mass: {mass:F0} | Closest Vehicle: {nearest.LabelCap} | DistSq: {bestDistSq}");
-                    candidateCount++;
+                    resourceBonus = 15f;
                 }
+                else if (defName.Contains("corpse") || defName.Contains("rotted") || defName.Contains("trash"))
+                {
+                    resourceBonus = -10f;
+                }
+                else if (defName.Contains("wood") || defName.Contains("stone"))
+                {
+                    resourceBonus = 5f;
+                }
+
+                float vehicleFit = nearest.RaceProps.baseBodySize * 10f;
+
+                float finalScore = massScore - distancePenalty + resourceBonus + vehicleFit;
+
+                Log.Message($"[AutoVehicleHaul] Candidate: {thing.LabelCap} | Vehicle: {nearest.LabelCap} | Score: {finalScore:F1} | DistSq: {bestDistSq}");
+
+                if (finalScore > bestScore)
+                {
+                    bestScore = finalScore;
+                    bestLabel = thing.LabelCap;
+                    bestVehicleLabel = nearest.LabelCap;
+                }
+
+                candidateCount++;
+            }
+
+            if (bestLabel != null)
+            {
+                Log.Message($"[AutoVehicleHaul] Best Candidate: {bestLabel} | Vehicle: {bestVehicleLabel} | Score: {bestScore:F1}");
             }
 
             Log.Message($"[AutoVehicleHaul] Candidates scanned: {candidateCount}");
