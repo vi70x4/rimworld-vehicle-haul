@@ -1,0 +1,59 @@
+{
+  "format": 1,
+  "restore": {
+    "/home/vi/rimworld-vehicle-haul/AutoVehicleHaul.csproj": {}
+  },
+  "projects": {
+    "/home/vi/rimworld-vehicle-haul/AutoVehicleHaul.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "/home/vi/rimworld-vehicle-haul/AutoVehicleHaul.csproj",
+        "projectName": "AutoVehicleHaul",
+        "projectPath": "/home/vi/rimworld-vehicle-haul/AutoVehicleHaul.csproj",
+        "packagesPath": "/home/vi/.nuget/packages/",
+        "outputPath": "/home/vi/rimworld-vehicle-haul/obj/",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "/home/vi/.nuget/NuGet/NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net48"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net48": {
+            "targetAlias": "net48",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "10.0.100"
+      },
+      "frameworks": {
+        "net48": {
+          "targetAlias": "net48",
+          "dependencies": {
+            "Microsoft.NETFramework.ReferenceAssemblies": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[1.0.3, )",
+              "autoReferenced": true
+            }
+          },
+          "runtimeIdentifierGraphPath": "/usr/share/dotnet/sdk/10.0.108/RuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}

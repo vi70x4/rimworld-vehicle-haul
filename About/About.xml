@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ModMetaData>
+  <name>Auto Vehicle Haul</name>
+  <author>vi</author>
+  <packageId>vi.autovehiclehaul</packageId>
+  <supportedVersions>
+    <li>1.6</li>
+  </supportedVersions>
+  <description>Automatically hauls idle vehicles to designated zones.</description>
+  <modVersion>0.1.0</modVersion>
+  <modDependencies>
+    <li>
+      <packageId>SmashPhil.VehicleFramework</packageId>
+      <displayName>Vehicle Framework</displayName>
+    </li>
+  </modDependencies>
+  <loadAfter>
+    <li>SmashPhil.VehicleFramework</li>
+  </loadAfter>
+</ModMetaData>

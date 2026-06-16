@@ -1,0 +1,9 @@
+/home/vi/rimworld-vehicle-haul/bin/Release/AutoVehicleHaul.dll
+/home/vi/rimworld-vehicle-haul/bin/Release/AutoVehicleHaul.pdb
+/home/vi/rimworld-vehicle-haul/obj/Release/AutoVehicleHaul.csproj.AssemblyReference.cache
+/home/vi/rimworld-vehicle-haul/obj/Release/AutoVehicleHaul.GeneratedMSBuildEditorConfig.editorconfig
+/home/vi/rimworld-vehicle-haul/obj/Release/AutoVehicleHaul.AssemblyInfoInputs.cache
+/home/vi/rimworld-vehicle-haul/obj/Release/AutoVehicleHaul.AssemblyInfo.cs
+/home/vi/rimworld-vehicle-haul/obj/Release/AutoVehicleHaul.csproj.CoreCompileInputs.cache
+/home/vi/rimworld-vehicle-haul/obj/Release/AutoVehicleHaul.dll
+/home/vi/rimworld-vehicle-haul/obj/Release/AutoVehicleHaul.pdb

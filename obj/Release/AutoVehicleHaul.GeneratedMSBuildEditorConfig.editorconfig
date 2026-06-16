@@ -1,0 +1,8 @@
+is_global = true
+build_property.RootNamespace = AutoVehicleHaul
+build_property.ProjectDir = /home/vi/rimworld-vehicle-haul/
+build_property.EnableComHosting = 
+build_property.EnableGeneratedComInterfaceComImportInterop = 
+build_property.CsWinRTUseWindowsUIXamlProjections = false
+build_property.EffectiveAnalysisLevelStyle = 
+build_property.EnableCodeStyleSeverity = 
