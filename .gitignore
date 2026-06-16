@@ -1,0 +1,24 @@
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+build/
+bld/
+[Bb]in/
+[Oo]j/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.cache
+*.vs/
+
+# NuGet
+**/packages/*
+!**/packages/build/
+
+# OS
+.DS_Store
+Thumbs.db
