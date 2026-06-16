@@ -580,7 +580,8 @@ namespace AutoVehicleHaul
         private void TickLoading(VehicleJobContext ctx)
         {
             // On entry: disembark driver, build cargo plan
-            if (ctx.TicksInState == 0)
+            // TicksInState is 1 on first entry because FSMTick increments before dispatch.
+            if (ctx.TicksInState == 1)
             {
                 DisembarkDriver(ctx);
                 ctx.SubState = LoadingSubState.Reserving;
@@ -990,7 +991,8 @@ namespace AutoVehicleHaul
         private void TickUnloading(VehicleJobContext ctx)
         {
             // On entry: disembark driver
-            if (ctx.TicksInState == 0)
+            // TicksInState is 1 on first entry because FSMTick increments before dispatch.
+            if (ctx.TicksInState == 1)
             {
                 DisembarkDriver(ctx);
                 Log.Message($"[AutoVehicleHaul] Unloading: Driver disembarked.");
