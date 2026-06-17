@@ -1,5 +1,6 @@
 using UnityEngine;
 using Verse;
+using Verse.AI;
 using Vehicles;
 using System.Linq;
 using RimWorld;
@@ -21,7 +22,12 @@ namespace AutoVehicleHaul
 
         public AutoVehicleHaulManager(Map map) : base(map)
         {
-            Log.Message("[AutoVehicleHaul] Constructor called");
+            // Clear static state on save load — otherwise reservedBy retains
+            // entries from the previous play session and the scan filters out
+            // all items as "already reserved".
+            jobContexts.Clear();
+            reservedBy.Clear();
+            Log.Message("[AutoVehicleHaul] Constructor called — static state cleared");
         }
 
         public override void MapComponentTick()
@@ -60,6 +66,13 @@ namespace AutoVehicleHaul
             // tick, preventing the vehicle from ever transitioning to Loading.
             if (ctx.State == VehicleState.MoveToPickup && ctx.Vehicle != null && !ctx.Vehicle.Destroyed)
             {
+                int distSq = ctx.Vehicle.Position.DistanceToSquared(ctx.TargetPickupPos);
+                bool moving = ctx.Vehicle.vehiclePather != null && ctx.Vehicle.vehiclePather.Moving;
+                // Log proximity every 30 ticks so we can see the approach
+                if (ctx.TicksInState % 30 == 0 || distSq <= 4)
+                {
+                    Log.Message($"[AutoVehicleHaul] ArrivalCheck: {ctx.Vehicle.LabelCap} pos={ctx.Vehicle.Position} target={ctx.TargetPickupPos} distSq={distSq} moving={moving}");
+                }
                 if (HasArrived(ctx.Vehicle, ctx.TargetPickupPos))
                 {
                     Log.Message($"[AutoVehicleHaul] Vehicle {ctx.Vehicle.LabelCap} arrived at pickup {ctx.TargetPickupPos}. Transitioning to Loading.");
@@ -389,6 +402,19 @@ namespace AutoVehicleHaul
                             }
                         }
                     }
+                    // Fallback: if movement handler didn't have a pawn, check all pawns aboard
+                    if (driver == null && bestVehicle.AllPawnsAboard != null)
+                    {
+                        foreach (var pawn in bestVehicle.AllPawnsAboard)
+                        {
+                            if (pawn is Pawn p)
+                            {
+                                driver = p;
+                                Log.Message($"[AutoVehicleHaul] Found driver from AllPawnsAboard: {driver.LabelCap}");
+                                break;
+                            }
+                        }
+                    }
                 }
                 else
                 {
@@ -404,14 +430,66 @@ namespace AutoVehicleHaul
                 // --- Phase 6c: Draft Vehicle ---
                 if (!drafted)
                 {
-                    if (bestVehicle.HasEnoughOperators)
+                    if (bestVehicle.HasEnoughOperators && bestVehicle.ignition != null)
                     {
-                        bestVehicle.ignition.Drafted = true;
-                        Log.Message($"[AutoVehicleHaul] Vehicle drafted via framework API. Drafted={bestVehicle.ignition.Drafted}");
+                        bool preDrafted = bestVehicle.ignition.Drafted;
+                        var vehicleType = bestVehicle.GetType();
+                        // Find CanDraft via reflection — it's public virtual on VehiclePawn
+                        var canDraftMethod = vehicleType.GetMethod("CanDraft", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
+                        bool canDraftSuccess = false;
+                        string canDraftReason = "method not found";
+                        if (canDraftMethod != null)
+                        {
+                            var canDraftResult = canDraftMethod.Invoke(bestVehicle, null);
+                            if (canDraftResult != null)
+                            {
+                                var successProp = canDraftResult.GetType().GetProperty("Accepted");
+                                var reasonProp = canDraftResult.GetType().GetProperty("Reason");
+                                if (successProp != null)
+                                    canDraftSuccess = (bool)successProp.GetValue(canDraftResult);
+                                if (reasonProp != null)
+                                    canDraftReason = reasonProp.GetValue(canDraftResult)?.ToString() ?? "no reason";
+                            }
+                            Log.Message($"[AutoVehicleHaul] Pre-draft: Drafted={preDrafted} | CanDraftSuccess={canDraftSuccess} | CanDraftReason={canDraftReason}");
+                        }
+                        else
+                        {
+                            // Walk the inheritance chain
+                            var currentType = vehicleType;
+                            while (currentType != null)
+                            {
+                                var m = currentType.GetMethod("CanDraft", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.DeclaredOnly);
+                                if (m != null)
+                                {
+                                    Log.Message($"[AutoVehicleHaul] Found CanDraft on {currentType.Name}");
+                                    var canDraftResult = m.Invoke(bestVehicle, null);
+                                    if (canDraftResult != null)
+                                    {
+                                        var successProp = canDraftResult.GetType().GetProperty("Accepted");
+                                        var reasonProp = canDraftResult.GetType().GetProperty("Reason");
+                                        if (successProp != null)
+                                            canDraftSuccess = (bool)successProp.GetValue(canDraftResult);
+                                        if (reasonProp != null)
+                                            canDraftReason = reasonProp.GetValue(canDraftResult)?.ToString() ?? "no reason";
+                                    }
+                                    Log.Message($"[AutoVehicleHaul] Pre-draft: Drafted={preDrafted} | CanDraftSuccess={canDraftSuccess} | CanDraftReason={canDraftReason}");
+                                    break;
+                                }
+                                currentType = currentType.BaseType;
+                            }
+                            if (currentType == null)
+                                Log.Message($"[AutoVehicleHaul] CanDraft not found on {vehicleType.Name} or any base type");
+                        }
+                        // Try ignition.Drafted = true directly
+                        if (bestVehicle.ignition != null)
+                        {
+                            bestVehicle.ignition.Drafted = true;
+                            Log.Message($"[AutoVehicleHaul] Direct ignition.Drafted=true set. Now Drafted={bestVehicle.ignition.Drafted}");
+                        }
                     }
                     else
                     {
-                        Log.Message("[AutoVehicleHaul] Cannot draft: HasEnoughOperators still false after driver assignment attempt.");
+                        Log.Message($"[AutoVehicleHaul] Cannot draft: HasEnoughOperators={bestVehicle.HasEnoughOperators} | ignition={bestVehicle.ignition != null}");
                         return;
                     }
                 }
@@ -421,7 +499,9 @@ namespace AutoVehicleHaul
                 }
 
                 // --- Build Cargo Plan ---
-                CargoPlan plan = BuildCargoPlan(bestVehicle, bestVehicle.Position, 20);
+                // Search for items near the TARGET ITEM, not near the vehicle.
+                // The vehicle may be far from the haul target (e.g. at warehouse).
+                CargoPlan plan = BuildCargoPlan(bestVehicle, bestThing.Position, 20);
 
                 // --- Create Job Context ---
                 var ctx = new VehicleJobContext
@@ -692,6 +772,26 @@ namespace AutoVehicleHaul
             var haulItem = ctx.Plan.Items[ctx.CurrentItemIndex];
             IntVec3 itemPos = haulItem.Position;
 
+            // Check if the item was hauled away by another colonist between ticks.
+            // If so, try to find a replacement nearby instead of pathing to a void.
+            if (haulItem.Item == null || !haulItem.Item.Spawned)
+            {
+                Log.Message($"[AutoVehicleHaul] Loading: {haulItem.Item?.LabelCap ?? "Item"} gone before MovingToItem. Scanning for replacement.");
+                Thing replacement = FindReplacementItem(ctx, ctx.Vehicle.Position);
+                if (replacement != null)
+                {
+                    Log.Message($"[AutoVehicleHaul] Loading: Replacement found: {replacement.LabelCap}");
+                    ctx.Plan.Items[ctx.CurrentItemIndex] = new HaulItem(replacement, replacement.Position, replacement.GetStatValue(StatDefOf.Mass));
+                    itemPos = replacement.Position;
+                }
+                else
+                {
+                    Log.Message("[AutoVehicleHaul] Loading: No replacement found. Skipping item.");
+                    ctx.SubState = LoadingSubState.ItemDone;
+                    return;
+                }
+            }
+
             // Check if driver is adjacent to item (distance squared <= 1 for adjacent, <= 4 for nearby)
             int distSq = ctx.DriverPawn.Position.DistanceToSquared(itemPos);
             if (distSq <= 4)
@@ -728,11 +828,24 @@ namespace AutoVehicleHaul
             var haulItem = ctx.Plan.Items[ctx.CurrentItemIndex];
             Thing item = haulItem.Item;
 
+            // If the item was hauled away by another colonist between ticks,
+            // try to find a replacement nearby instead of failing.
             if (item == null || !item.Spawned)
             {
-                Log.Message("[AutoVehicleHaul] Loading: Item no longer exists during PickingUp.");
-                ctx.SubState = LoadingSubState.Failed;
-                return;
+                Log.Message($"[AutoVehicleHaul] Loading: {haulItem.Item?.LabelCap ?? "Item"} gone. Scanning for replacement.");
+                Thing replacement = FindReplacementItem(ctx, haulItem.Position);
+                if (replacement != null)
+                {
+                    Log.Message($"[AutoVehicleHaul] Loading: Replacement found: {replacement.LabelCap}");
+                    ctx.Plan.Items[ctx.CurrentItemIndex] = new HaulItem(replacement, replacement.Position, replacement.GetStatValue(StatDefOf.Mass));
+                    item = replacement;
+                }
+                else
+                {
+                    Log.Message("[AutoVehicleHaul] Loading: No replacement found. Skipping item.");
+                    ctx.SubState = LoadingSubState.ItemDone;
+                    return;
+                }
             }
 
             // Check if vehicle is full
@@ -758,6 +871,35 @@ namespace AutoVehicleHaul
                 ctx.SubState = LoadingSubState.StoringInVehicle;
                 ctx.SubStateTicks = 0;
             }
+        }
+
+        /// <summary>
+        /// Find a replacement haul-designated item near the given position.
+        /// Used when the original item was hauled away by another colonist.
+        /// </summary>
+        private Thing FindReplacementItem(VehicleJobContext ctx, IntVec3 nearPos)
+        {
+            float bestDistSq = 64f; // Search within 8 tiles
+            Thing bestItem = null;
+
+            foreach (var thing in map.listerThings.AllThings)
+            {
+                if (!thing.Spawned) continue;
+                if (thing.def.category != ThingCategory.Item) continue;
+                if (thing.stackCount <= 0) continue;
+                if (!thing.def.EverHaulable) continue;
+                if (map.designationManager.DesignationOn(thing, DesignationDefOf.Haul) == null) continue;
+                if (reservedBy.ContainsKey(thing)) continue;
+
+                float distSq = thing.Position.DistanceToSquared(nearPos);
+                if (distSq < bestDistSq)
+                {
+                    bestDistSq = distSq;
+                    bestItem = thing;
+                }
+            }
+
+            return bestItem;
         }
 
         private void TickLoading_StoringInVehicle(VehicleJobContext ctx)
@@ -897,6 +1039,28 @@ namespace AutoVehicleHaul
                 return;
             }
 
+            // Driver aboard check — if driver is on the map (e.g. ReembarkDriver
+            // failed silently after loading), the vehicle can't move. Try to
+            // re-embark; if that fails, fail-safe instead of looping forever.
+            if (!ctx.DriverPawn.InVehicle())
+            {
+                Log.Message("[AutoVehicleHaul] MoveToWarehouse: Driver not aboard! Attempting re-embark.");
+                try
+                {
+                    ReembarkDriver(ctx);
+                }
+                catch (System.Exception ex)
+                {
+                    Log.Message($"[AutoVehicleHaul] MoveToWarehouse: Reembark failed: {ex.Message}");
+                }
+                if (!ctx.DriverPawn.InVehicle())
+                {
+                    Log.Message("[AutoVehicleHaul] MoveToWarehouse: Reembark still failed. Failing safe.");
+                    TransitionState(ctx, VehicleState.FailSafe);
+                    return;
+                }
+            }
+
             // Timeout check
             if (ctx.TicksInState > 600)
             {
@@ -995,13 +1159,14 @@ namespace AutoVehicleHaul
             if (ctx.TicksInState == 1)
             {
                 DisembarkDriver(ctx);
-                Log.Message($"[AutoVehicleHaul] Unloading: Driver disembarked.");
+                Log.Message($"[AutoVehicleHaul] Unloading: Driver disembarked. Warehouse={ctx.TargetWarehousePos}, InventoryCount={ctx.Vehicle.inventory.innerContainer.Count}");
             }
 
             // Vehicle destruction check
             if (ctx.Vehicle == null || ctx.Vehicle.Destroyed)
             {
-                Log.Message("[AutoVehicleHaul] Unloading: Vehicle destroyed! Failing safe.");
+                Log.Message("[AutoVehicleHaul] Unloading: Vehicle destroyed! Dropping inventory and failing safe.");
+                DropInventoryItems(ctx);
                 TransitionState(ctx, VehicleState.FailSafe);
                 return;
             }
@@ -1009,7 +1174,8 @@ namespace AutoVehicleHaul
             // Safety check: driver must exist
             if (!DriverExists(ctx))
             {
-                Log.Message("[AutoVehicleHaul] Unloading: Driver missing! Failing safe.");
+                Log.Message("[AutoVehicleHaul] Unloading: Driver missing! Dropping inventory and failing safe.");
+                DropInventoryItems(ctx);
                 TransitionState(ctx, VehicleState.FailSafe);
                 return;
             }
@@ -1017,7 +1183,8 @@ namespace AutoVehicleHaul
             // Timeout check
             if (ctx.TicksInState >= 600)
             {
-                Log.Message("[AutoVehicleHaul] Unloading timeout (600 ticks). Failing safe.");
+                Log.Message("[AutoVehicleHaul] Unloading timeout (600 ticks). Dropping inventory and failing safe.");
+                DropInventoryItems(ctx);
                 TransitionState(ctx, VehicleState.FailSafe);
                 return;
             }
@@ -1039,16 +1206,70 @@ namespace AutoVehicleHaul
             Thing item = ctx.Vehicle.inventory.innerContainer[0];
             if (item != null)
             {
-                ctx.Vehicle.inventory.innerContainer.Remove(item);
                 IntVec3 spawnPos = ctx.TargetWarehousePos;
+
+                // Validate warehouse position — if it's IntVec3.Zero, the warehouse
+                // was never found. Use vehicle position as fallback.
+                if (spawnPos == IntVec3.Zero)
+                {
+                    Log.Message($"[AutoVehicleHaul] Unloading: TargetWarehousePos is Zero (no stockpile found). Using vehicle position {ctx.Vehicle.Position} as fallback.");
+                    spawnPos = ctx.Vehicle.Position;
+                }
+
                 // Find a nearby valid cell if warehouse pos is occupied
                 if (!spawnPos.Walkable(map))
                 {
                     spawnPos = CellFinder.RandomClosewalkCellNear(spawnPos, map, 2);
                 }
-                GenSpawn.Spawn(item, spawnPos, map);
-                Log.Message($"[AutoVehicleHaul] Unloading: Spawned {item.LabelCap} at {spawnPos}. Remaining={ctx.Vehicle.inventory.innerContainer.Count}");
+
+                // Spawn FIRST, then remove from inventory — so a spawn failure
+                // doesn't destroy the item.
+                try
+                {
+                    GenSpawn.Spawn(item, spawnPos, map);
+                    ctx.Vehicle.inventory.innerContainer.Remove(item);
+                    Log.Message($"[AutoVehicleHaul] Unloading: Spawned {item.LabelCap} at {spawnPos}. Remaining={ctx.Vehicle.inventory.innerContainer.Count}");
+                }
+                catch (System.Exception ex)
+                {
+                    Log.Message($"[AutoVehicleHaul] Unloading: Failed to spawn {item.LabelCap} at {spawnPos}: {ex.Message}. Item stays in vehicle.");
+                }
             }
+        }
+
+        /// <summary>
+        /// Drop all items from the vehicle inventory onto the ground at the vehicle's position.
+        /// Called when unloading can't complete (timeout, destruction, driver loss) so items
+        /// don't vanish into the void.
+        /// </summary>
+        private void DropInventoryItems(VehicleJobContext ctx)
+        {
+            if (ctx.Vehicle == null || ctx.Vehicle.inventory == null)
+                return;
+
+            IntVec3 dropPos = ctx.Vehicle.Position;
+            int dropped = 0;
+            while (ctx.Vehicle.inventory.innerContainer.Count > 0)
+            {
+                Thing item = ctx.Vehicle.inventory.innerContainer[0];
+                ctx.Vehicle.inventory.innerContainer.Remove(item);
+
+                IntVec3 spawnPos = dropPos;
+                if (!spawnPos.Walkable(map))
+                    spawnPos = CellFinder.RandomClosewalkCellNear(dropPos, map, 3);
+
+                try
+                {
+                    GenSpawn.Spawn(item, spawnPos, map);
+                    dropped++;
+                }
+                catch (System.Exception ex)
+                {
+                    Log.Message($"[AutoVehicleHaul] DropInventory: Failed to drop {item?.LabelCap}: {ex.Message}");
+                }
+            }
+            if (dropped > 0)
+                Log.Message($"[AutoVehicleHaul] DropInventory: Dropped {dropped} items at {dropPos}.");
         }
 
         // ─────────────────────────────────────────────
@@ -1066,6 +1287,10 @@ namespace AutoVehicleHaul
                 // Release all reservations held by this context
                 try { ReleaseReservations(ctx); }
                 catch (System.Exception ex) { Log.Message($"[AutoVehicleHaul] FailSafe: Exception releasing reservations: {ex.Message}"); }
+
+                // Drop any remaining inventory items so they don't vanish
+                try { DropInventoryItems(ctx); }
+                catch (System.Exception ex) { Log.Message($"[AutoVehicleHaul] FailSafe: Exception dropping inventory: {ex.Message}"); }
 
                 // Re-embark driver (skip if driver is null/dead)
                 try
@@ -1236,16 +1461,27 @@ namespace AutoVehicleHaul
         }
 
         /// <summary>
-        /// Check if vehicle has arrived at the target position (same tile).
-        /// Previously <= 4 (2-cell Chebyshev radius) which caused false-positive
-        /// arrival when vehicle started 2 cells away — HasArrived fired before
-        /// StartPath ever ran, producing the "one step then stuck" symptom.
+        /// Check if vehicle has arrived at the target position.
+        /// Uses Chebyshev distance <= 2 AND requires the vehicle's path to
+        /// have completed (vehiclePather.Moving == false).  This handles
+        /// multi-cell objects (e.g. slate chunks) where the vehicle may path
+        /// to a cell adjacent to the thing's Position, while avoiding the
+        /// false-positive "one step then stuck" when the vehicle is merely
+        /// passing by at distance 2 at the moment StartPath is issued.
         /// </summary>
         private bool HasArrived(VehiclePawn vehicle, IntVec3 target)
         {
-            if (vehicle == null)
+            if (vehicle == null || vehicle.Destroyed)
                 return false;
-            return vehicle.Position.DistanceToSquared(target) <= 1;
+            int distSq = vehicle.Position.DistanceToSquared(target);
+            // Chebyshev distance <= 2 (covers adjacent + diagonal-adjacent for multi-cell things)
+            // AND vehicle must have finished its path (not still moving toward the target)
+            if (distSq <= 4 && vehicle.vehiclePather != null && !vehicle.vehiclePather.Moving)
+                return true;
+            // Also arrive if we're literally on the target cell
+            if (distSq == 0)
+                return true;
+            return false;
         }
 
         /// <summary>
@@ -1280,13 +1516,26 @@ namespace AutoVehicleHaul
             if (ctx.DriverPawn == null)
                 return;
 
-            if (ctx.Vehicle != null)
+            // Only disembark if the pawn is actually on the vehicle.
+            // If ReembarkDriver failed earlier, the pawn may already be on
+            // the map — calling DisembarkPawn would throw or do nothing
+            // useful, and the state flags would be wrong.
+            if (ctx.Vehicle != null && ctx.DriverPawn.InVehicle())
             {
                 ctx.Vehicle.DisembarkPawn(ctx.DriverPawn);
             }
 
             ctx.DriverPresence = DriverPresence.OnMap;
             ctx.DriverRole = DriverRole.Working;
+
+            // Draft the driver so RimWorld's AI can't steal them for other jobs
+            // (hauling skeletons, vomiting, etc.) while the loading sub-FSM runs.
+            // We track that WE drafted them so we only undraft in ReembarkDriver.
+            if (ctx.DriverPawn.drafter != null && !ctx.DriverPawn.drafter.Drafted)
+            {
+                ctx.DriverPawn.drafter.Drafted = true;
+                ctx.WeDraftedDriver = true;
+            }
         }
 
         /// <summary>
@@ -1296,6 +1545,14 @@ namespace AutoVehicleHaul
         {
             if (ctx.DriverPawn == null || ctx.Vehicle == null)
                 return;
+
+            // Undraft the driver if we drafted them at DisembarkDriver time.
+            // This restores normal AI behavior for driving / idle.
+            if (ctx.WeDraftedDriver && ctx.DriverPawn.drafter != null)
+            {
+                ctx.DriverPawn.drafter.Drafted = false;
+                ctx.WeDraftedDriver = false;
+            }
 
             // Find the movement handler
             VehicleRoleHandler movementHandler = null;
@@ -1316,8 +1573,22 @@ namespace AutoVehicleHaul
                 ctx.Vehicle.TryAddPawn(ctx.DriverPawn, movementHandler);
             }
 
-            ctx.DriverPresence = DriverPresence.OnVehicle;
-            ctx.DriverRole = DriverRole.Driving;
+            // Only mark as aboard if the pawn actually got into the vehicle.
+            // TryAddPawn can fail silently (e.g. pawn in mental state, vehicle
+            // destroyed between ticks), leaving the pawn on the map while
+            // DriverPresence says OnVehicle — which triggers IsDriverStateValid
+            // to fail-safe on the next tick, abandoning the job.
+            if (ctx.DriverPawn.InVehicle())
+            {
+                ctx.DriverPresence = DriverPresence.OnVehicle;
+                ctx.DriverRole = DriverRole.Driving;
+            }
+            else
+            {
+                Log.Message($"[AutoVehicleHaul] ReembarkDriver: {ctx.DriverPawn.LabelCap} not in vehicle after TryAddPawn. DriverPresence stays OnMap.");
+                ctx.DriverPresence = DriverPresence.OnMap;
+                ctx.DriverRole = DriverRole.Working;
+            }
         }
 
         /// <summary>

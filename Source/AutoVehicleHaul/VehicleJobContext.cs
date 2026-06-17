@@ -62,20 +62,21 @@ namespace AutoVehicleHaul
         public int FailSafeCooldown;
         public IntVec3 LastMovePos;
         public int StuckTicks;
+        public bool WeDraftedDriver;
     }
 
-    public readonly struct CargoPlan
+    public class CargoPlan
     {
-        public IReadOnlyList<HaulItem> Items { get; }
+        public List<HaulItem> Items { get; }
         public VehiclePawn TargetVehicle { get; }
         public IntVec3 PickupPos { get; }
         public IntVec3 WarehousePos { get; }
-        public int TotalMass { get; }
         public int TotalCount { get; }
+        public int TotalMass { get; }
 
         public CargoPlan(List<HaulItem> items, VehiclePawn vehicle, IntVec3 pickup, IntVec3 warehouse)
         {
-            Items = items.AsReadOnly();
+            Items = items;
             TargetVehicle = vehicle;
             PickupPos = pickup;
             WarehousePos = warehouse;
